@@ -10,10 +10,11 @@ struct request_info {
 	char host[LINE];
 	char path[LINE];
 	int port;
+	int cont_length;
 };
 
 void *proxy_thread(void *vargp);
-int req_line_parse(char * line, struct request_info * p); 
+void req_line_parse(char * line, struct request_info * p); 
 
 int connect_server(struct request_info * req);
 void dec2str(int src, char * dest);

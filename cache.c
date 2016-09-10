@@ -1,14 +1,18 @@
 /*
-1. The cache buffer is created at the beginning;
-2. A node list contains nodes which have info such as host, path 
-   and a pointer to the cache buffer where the real cache object is stored;
-3. There are 2 node list, one containing available nodes, 
-   the other containing the deleted nodes; 
-   Once a cache copy expires, or is no longer valid, 
-   we move its node from the available list to the deleted list. 
-4. Every time we need to cache an object, we first check the deleted list, 
-   if not empty we would cache the objet in the buffer pointed by 
-   the first deleted node, and move that node to the available list.
+1. There are 2 lists of (struct) nodes, one of which is called  "valid list" 
+   because its nodes contain valid caches, and the other of which is called 
+   "invalid list" because its nodes contain invalid caches; 
+
+   Once a valid cache becomes invalid such as when it has expired, we move 
+   the node containing this cache from the valid list into front of the 
+   invalid list. 
+
+2. Valid list:  we insert into its frond and delete from its end; 
+		We record both its head and tail, and each node has both a pointer 
+		to the previous node and a pointer to the next node.
+   
+   Invalid list:  we both insert and delete from its front; We record only 
+		its head, and each node has only a pointer to its next node.
 */
 #include <stdio.h>
 #include <string.h>
@@ -18,138 +22,140 @@
 
 #include "cache.h"
 
-struct cache cach_info;
+static struct cache valid_list;
+static struct cache invalid_list;
 
 void cach_init()
 {
-    cach_info.head = NULL;
-    cach_info.size = 0; 
+    valid_list.head = valid_list.tail = NULL;
+    valid_list.size = 0; 
+
+	invalid_list.head = invalid_list.tail = NULL;
+	invalid_list.size = 0;
 	return;
 }
-/* Add body to the head of the cache buffer; 
-   Return the node ptr to the place where data is added,
+/* Add node containing new cache to the head of the valid list;
+   Return the pointer to the node where the new cache is stored on success,
    and NULL on error */
 struct node * cach_add(char * host, char * path, 
               struct tm *expire, char *body, int len)
 {
-	struct node * nd = NULL;	
-	struct cache * p = &cach_info;
-    if((p->size + MAX_OBJECT_SIZE) > MAX_CACHE_SIZE) //Buffer is full;
-        return cach_insert( host, path, expire, body, len);
-    
-	if((nd = (struct node *) malloc(sizeof(struct node))) == NULL) {
-		    printf("WARNING: Malloc failure\n");
-			return cach_insert(host, path, expire, body, len);
-			
-	}
+	if(len > MAX_OBJECT_SIZE)
+		return NULL;
+
+	struct node * nd;	
+	struct cache * vlst = &valid_list;
+	struct cache * ilst = &invalid_list;
+
+	// If invalid_list is not empty, cache data to its head node and move 
+	// that node into the front of valid_list;
+	if(ilst->head != NULL) {
+		nd = ilst->head;
+		ilst->head = nd->next;
+
+		vlst->size += MAX_OBJECT_SIZE;
+	} 
+	// If the invalid list is empty and our buffer is not full, allocate 
+	// a new node and insert it into the front of the valid list;
+	else if(vlst->size < MAX_CACHE_SIZE) {
+		if((nd = (struct node *) malloc(sizeof(struct node))) == NULL) {
+				printf("WARNING: Malloc failure\n");
+				return NULL;
+		}
+		vlst->size += MAX_OBJECT_SIZE;
+	} 
+	// If buffer is full, remove the LRU node (tail) from the valid list,
+	// rewrite the node and then insert it into the front of the valid list;
+	// It's a FIFO policy; 
+	else {
+		nd = vlst->tail;
+		struct node *prev = nd->prev;
+		prev->next = NULL;
+		vlst->tail = prev;
+	} 
 		
-	p->size +=  MAX_OBJECT_SIZE;
+	// Insert node into the front of the valid list;		
+	struct node *vhd = vlst->head;
+	if(vhd != NULL) 
+		vhd->prev = nd;
+	else 
+		vlst->tail = nd;
 	
+	nd->next = vhd;
+	nd->prev = NULL;
+	vlst->head = nd;
+
+	// Store cache and metainforamtion;	
 	strcpy(nd->host, host);
 	strcpy(nd->path, path);
 	strncpy(nd->data, body, len);
 	nd->len = len;
     nd->expire = expire;
-
-    // Insert the node to the head of the available list;
- 	nd->next = p->head;
-    p->head = nd;
 	
 	return nd;
 }
 
-/* Replace the LRU cache copy with body, and make it the new head; 
-   called only when the deleted list empty and no space for more nodes; 
-   Return the node ptr to the place data is inserted, and NULL on error */
-struct node * cach_insert(char *host, char *path, 
-                          struct tm *expire, char *body, int len)
-{   
-	if(cach_info.head == NULL)
-		return NULL;
-
-    struct node *p, *prev;
-	p = cach_info.head;
-	prev = NULL;
-	while(p->next != NULL) {
-	    prev = p;
-		p = p->next;
-	}
-    
-	strcpy(p->host, host);
-	strcpy(p->path, path);
-	strncpy(p->data, body, len);
-	p->expire = expire;
-	p->len = len;
-
-	if(prev == NULL) 
-		return p;
-    
-	prev->next = NULL;
-    p->next = cach_info.head;
-	cach_info.head = p;
-
-	return p; 
-}
-
-// Delete the node p from the available list and insert it to the deleted;
-void cach_delete(struct node *p, struct node *prev)
+// Remove the pointed node from the valid list and insert it into
+// the front of the invalid list;
+void cach_delete(struct node *nd)
 {  
-	//Delete the node p from the available list;
-	if(prev == NULL) //if p is the head of the node list
-		cach_info.head = p->next;	
-	else
-		prev->next = p->next;
-		
-    free(p);
+	struct node *prev = nd->prev;
+	struct node *next = nd->next;
+	if(prev != NULL) {
+		prev->next = next;
+		if(next != NULL)
+			next->prev = prev;
+		else 
+			valid_list.tail = prev;
+	}
+	else {
+		valid_list.head = next;
+		if(next != NULL)
+			next->prev = NULL;
+		else 
+			valid_list.tail = NULL;
+	}
+
+	// Insert node nd into the front of the invalid list;
+	nd->next = invalid_list.head;
+	invalid_list.head = nd;
+
 	return;
 }
 
-
-
-/* Search the cache copy matching the host and path from the cache buffer, 
-   and return the corresponding node pointer; If prev is NULL, ignore it; 
-   otherwise fill in its ref. the node addr prev to the returned node;
-   Return NULL if not found. */
-struct node * cach_search(char *host, char *path, struct node **prev)
+// Search in the valid list for the node that matches the host and path;
+// Return the address of the found node on succsse or NULL if not found;
+struct node * cach_search(char *host, char *path)
 {
-    if(cach_info.head == NULL)
-	    return NULL;
-	
-	int flag; //Should or not fill the address value of the previous node;
-	if(prev == NULL) 
-		flag = 0;
-	else  
-		flag = 1;
-
-    struct node * p;
-	p = cach_info.head;
-    if(flag)
-	    *prev = NULL;
-
-	while(p != NULL) {
+    struct node * nd = valid_list.head;
+	while(nd != NULL) {
 	    //If both host names and pathes math;
-        if((!strcmp(p->host, host)) && (!strcmp(p->path, path)))	    
+        if((!strcmp(nd->host, host)) && (!strcmp(nd->path, path)))	    
 		    break;	
-		if(flag)
-			*prev = p;
-		
-		p = p->next;
+		nd = nd->next;
 	}	   
 	
-	return p;    	
+	return nd;    	
 }
 
 void cach_free()
 {
     struct node *p, *prev;
-	p = cach_info.head;
+	p = valid_list.head;
 	while(p != NULL) {
 		prev = p;
 		p = p->next;
 		free(prev);
 	}	
-    cach_info.head = NULL;
+    valid_list.head = valid_list.tail = NULL;
+
+	p = invalid_list.head;
+	while(p != NULL) {
+		prev = p;
+		p = p->next;
+		free(prev);
+	}
+	invalid_list.head = invalid_list.tail = NULL;
 
     return;
 }
-

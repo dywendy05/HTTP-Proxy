@@ -8,7 +8,10 @@
 This directory contains the files you will need for the CS:APP Proxy
 Lab.
 
+proxy.h
 proxy.c
+	These are the main files for this proxy. They're modified by 
+	the student;
 csapp.h
 csapp.c
     These are starter files.  csapp.c and csapp.h are described in
@@ -17,7 +20,10 @@ csapp.c
 
     Please use `port_for_user.pl' (as described below) to generate a 
     port for your proxy.
-
+cache.h
+cache.c
+	These are files to handle the caching policies of this proxy.
+	They're created by the student.
 README
     This file  
 

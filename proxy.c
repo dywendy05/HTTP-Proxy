@@ -1,8 +1,4 @@
 #define _XOPEN_SOURCE
-//#define CACHE_LOG "cache_log"
-//#define HEADER_LOG "header_log"
-//#define SERVER_LOG "server_log"
-//#define RESP_LOG "resp_log"
 
 #include <stdio.h>
 #include <fcntl.h>
@@ -11,7 +7,7 @@
 #include "csapp.h"
 #include "proxy.h"
 
-//#define DEBUG
+#define DEBUG
 #ifdef DEBUG
 # define dbg_printf(...) printf(__VA_ARGS__)
 #else 
@@ -19,6 +15,8 @@
 
 # define dbg_printf(...)
 #endif
+
+#define min(a, b) (((a) < (b)) ? (a) : (b))
 
 static const char *user_agent = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; "
                                 "rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
@@ -82,25 +80,22 @@ void *proxy_thread(void *vargp)
 	    close(client_fd);
 		pthread_exit(NULL);
 	}
-    
+  	 
 	dbg_printf("\n\n\nRequest received: %s\n", line);
 	  
     struct request_info req;
 	memset(&req, 0, sizeof(struct request_info));
 
-    if((req_line_parse(line, &req)) == -1) {
-	    sprintf(body, "Do not accept POST method\r\n");
-        rio_writen(client_fd, body, strlen(body));
-		dbg_printf("Do not accept POST method\n");
-		close(client_fd);
-	    pthread_exit(NULL);
-	}
-	sprintf(body, "%s %s HTTP/1.0", req.method, req.path);
-	sprintf(hdrs, "\r\n");	
-	if(header_parse(&rio_client, &req, hdrs)) {
+    req_line_parse(line, &req);
+
+	sprintf(body, "%s %s HTTP/1.0\r\n", req.method, req.path);
+
+	if(header_parse(&rio_client, &req, hdrs) || 
+	   (strcmp(req.method, "GET") && strcmp(req.method, "HEAD"))) {
 	    search_cache = 0;
 		cacheable = 0;
 	} 
+	// Do not search/store cache if the request method is neither GET nor HEAD;
 	strcat(body, hdrs);
 
     //Cache part;
@@ -112,10 +107,9 @@ void *proxy_thread(void *vargp)
 	
 	if(search_cache) {
         P(&mutex);
-		struct node *prev;
 
 		//Hit;
-	    if((nd = cach_search(req.host, req.path, &prev)) 
+	    if((nd = cach_search(req.host, req.path)) 
 			!= NULL) {
 			//Delete the cache copy if it has expired;
 		    struct tm *expire = nd->expire;
@@ -123,7 +117,7 @@ void *proxy_thread(void *vargp)
 				((expire->tm_year < cur_time->tm_year) || 
 				((expire->tm_year == cur_time->tm_year) && 
 				(expire->tm_yday <= cur_time->tm_yday))) ) 
-                cach_delete(nd, prev); 
+                cach_delete(nd); 
 			else {
 			    hit = 1; 
 				buf_len = nd->len;
@@ -135,28 +129,49 @@ void *proxy_thread(void *vargp)
     
     dbg_printf("search_cache is %d, hit is %d\n", search_cache, hit);
 
-//    int resp_log_fd = open(RESP_LOG, O_WRONLY, 0);
 	if(hit) {
-//		rio_writen(resp_log_fd, local_buf, buf_len);
 	    rio_writen(client_fd, local_buf, buf_len);
-//		close(resp_log_fd);
 		close(client_fd);
 		pthread_exit(NULL);	
 	}
-
-//	int server_log_fd = open(SERVER_LOG, O_WRONLY, 0);  
-//	int cach_log_fd = open(CACHE_LOG, O_WRONLY, 0);
-
 
     //Cache NOT hit, connect the server:
 	int server_fd;
 	if((server_fd = connect_server(&req)) == -1) 
 		error_msg(client_fd, "Server connection failure");
 
-//	rio_writen(server_log_fd, body, strlen(body));
+	char entity[MAXLINE];
 	if(rio_writen(server_fd, body, strlen(body)) <= 0) {
 		close(server_fd);
 		error_msg(client_fd, "Server broke!");
+
+		int n = req.cont_length;
+		if(n > MAXLINE) {
+			int cnt_read = 0;
+			// Send the entity body (if any) in request to server line by line;
+			while(n > 0) {
+				if((cnt_read = 
+					rio_readlineb(&rio_client, line, min(n, MAXLINE)))<=0) {
+					close(client_fd);
+					pthread_exit(NULL);
+				}
+				if(rio_writen(server_fd, line, cnt_read) <= 0) {
+					close(server_fd);
+					error_msg(client_fd, "Server broke!");
+				}
+				n -= cnt_read;
+			}
+		}
+		else if(n > 0) {
+			if(rio_readlineb(&rio_client, entity, n) <= 0) {
+				close(client_fd);
+				pthread_exit(NULL);
+			}
+			if(rio_writen(server_fd, entity, n) <= 0) {
+				close(server_fd);
+				error_msg(client_fd, "Server broke!");	
+			}
+		}
 	}
 
     rio_t rio_server;
@@ -168,38 +183,36 @@ void *proxy_thread(void *vargp)
 		close(server_fd);
 		error_msg(client_fd, "Server broke!");
 	}
-	local_buf[MAX_BUF_SIZE - 1] = '\0';
+	local_buf[n] = '\0';
 	int rd_flg; // redirection flag;
 	response_parse(local_buf, &expire, &cacheable, &rd_flg, location);
 
-	// Status code in response indicates redirection, in which case we'll
-	// retry connection to the server;
-	if(rd_flg) {
+	// Status code(300, 301, 302) in response indicates redirection, 
+	// in which case we'll retry connection to the server;
+	if(rd_flg && (req.cont_length <= MAXLINE)) {
 		sprintf(line, "%s %s HTTP/1.0\r\n", req.method, location);
-		if((req_line_parse(line, &req)) == -1) {
-			error_msg(client_fd, "Invalid HTTP scheme");
-			dbg_printf("Invalid HTTP scheme\n");
-		}
+		req_line_parse(line, &req);
 		close(server_fd);
+
 		if((server_fd = connect_server(&req)) == -1) 
 			error_msg(client_fd, "Server connection failure");
-
-		sprintf(body, "%s %s HTTP/1.0", req.method, req.path);
-		dbg_printf("New request: %s\n", body);
-		strcat(body, hdrs);
 	
-//		rio_writen(server_log_fd, body, strlen(body));	
-		if(rio_writen(server_fd, body, strlen(body)) <= 0) {
+		memset(body, 0, sizeof(body));
+		sprintf(body, "%s %s HTTP/1.0%s", req.method, req.path, hdrs);
+		dbg_printf("New request: %s %s HTTP/1.0\n", req.method, req.path);
+	
+		if((rio_writen(server_fd, body, strlen(body)) <= 0) ||
+			(req.cont_length > 0 && 
+			 rio_writen(server_fd, entity, req.cont_length) <= 0)) {
 			close(server_fd);
 			error_msg(client_fd, "Server broke!");
 		}
-
 		rio_readinitb(&rio_server, server_fd);
 		if((n = rio_readnb(&rio_server, local_buf, MAX_BUF_SIZE - 1)) <= 0) {
 			close(server_fd);
 			error_msg(client_fd, "Server broke!");
 		}
-		local_buf[MAX_BUF_SIZE - 1] = '\0';
+		local_buf[n] = '\0';
 		response_parse(local_buf, &expire, &cacheable, NULL, location);
 	}
 
@@ -210,7 +223,7 @@ void *proxy_thread(void *vargp)
 	}
 
     dbg_printf("cacheable = %d, n is %d\n", cacheable, n);
-    //If cacheable;
+    
 	if(cacheable && (n <= MAX_OBJECT_SIZE)) { 
 		P(&mutex);
 	    if((nd =  cach_add(req.host, req.path, expire, local_buf, n))
@@ -219,12 +232,10 @@ void *proxy_thread(void *vargp)
 		    cach_free();	
 			exit(0);
 		}
-//		rio_writen(cach_log_fd, nd->data, n);
 		V(&mutex);
 	}
     
 	do {
-//		rio_writen(resp_log_fd, local_buf, n);
 	    if(write(client_fd, local_buf, n) <= 0) {
 		    close(client_fd);
 			close(server_fd);
@@ -232,25 +243,18 @@ void *proxy_thread(void *vargp)
 		}
 	} while((n = rio_readnb(&rio_server, local_buf, MAX_BUF_SIZE)) > 0);
 
-
 	close(server_fd);
 	close(client_fd);
-//	close(server_log_fd);
-//	close(resp_log_fd);
-//	close(cach_log_fd);
-    
     return NULL;
 }
 
-int req_line_parse(char * line, struct request_info * p) 
+void req_line_parse(char * line, struct request_info * p) 
 {
 	char uri[MAXLINE];
 	char port[24];
-    sscanf(line, "%s %s %s", p->method, uri, p->version);		
-	if(!strcmp(p->method, "POST")) {
-		return -1;
-	}
-    
+    sscanf(line, "%s %s %s", p->method, uri, p->version);	
+	upper_string(p->method);
+
 	char *sp1, *sp2, *sp3;
 	if((sp1 = strstr(uri, "://")))
 		sp1 += strlen("://");
@@ -281,7 +285,7 @@ int req_line_parse(char * line, struct request_info * p)
 	
 	strcpy(p->host, sp1);
 
-	return 0;
+	return;
 }
 
 // Return -1 on error, and the file descriptor of the server otherwise;
@@ -344,7 +348,7 @@ void dec2str(int src, char * dest)
 	
 }
 
-// Return 1 if conditions that no-cache-search and not-cacheable are met, 0 o/w;
+// Return 1 if conditions for no-cache-search and not-cacheable are met, 0 o/w;
 int header_parse(rio_t * rp, struct request_info *req, char *headers)
 {
     char line[MAXLINE];
@@ -353,6 +357,7 @@ int header_parse(rio_t * rp, struct request_info *req, char *headers)
 	int hflag = 0;
 	int no_cach_flag = 0;
 
+	req->cont_length = 0;
 //	int hd_log_fd = open(HEADER_LOG, O_WRONLY, 0);
 	while((rio_readlineb(rp, line, MAXLINE)) > 0 ) {
 //		rio_writen(hd_log_fd, line, MAXLINE);
@@ -360,9 +365,11 @@ int header_parse(rio_t * rp, struct request_info *req, char *headers)
 			break;
 	    sscanf(line, "%s %s", name, value);
 		upper_string(name);
-		
+	
 		if(!strcmp(name, "HOST:")) 
 			hflag = 1;
+		else if(!strcmp(name, "CONTENT-LENGTH:")) 
+			req->cont_length = atoi(value);
 		else if(!strcmp(name, "AUTHORIZATION:")) 
 			no_cach_flag = 1;
 		else if(!strcmp(name, "IF-MODIFIED-SINCE:"))
@@ -403,7 +410,6 @@ int header_parse(rio_t * rp, struct request_info *req, char *headers)
 	sprintf(headers, "%sConnection: close\r\nProxy-Connection: close\r\n\r\n",
 			headers);	
 	
-//	close(hd_log_fd);	
 	if(no_cach_flag)
 		return 1;
 
