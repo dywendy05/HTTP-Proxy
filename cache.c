@@ -37,8 +37,8 @@ void cach_init()
 /* Add node containing new cache to the head of the valid list;
    Return the pointer to the node where the new cache is stored on success,
    and NULL on error */
-struct node * cach_add(char * host, char * path, 
-              struct tm *expire, char *body, int len)
+struct node * cach_add(char *host, char *path, struct tm *expire, 
+					   char *body, int len)
 {
 	if(len > MAX_OBJECT_SIZE)
 		return NULL;
@@ -52,7 +52,6 @@ struct node * cach_add(char * host, char * path,
 	if(ilst->head != NULL) {
 		nd = ilst->head;
 		ilst->head = nd->next;
-
 		vlst->size += MAX_OBJECT_SIZE;
 	} 
 	// If the invalid list is empty and our buffer is not full, allocate 
@@ -62,6 +61,7 @@ struct node * cach_add(char * host, char * path,
 				printf("WARNING: Malloc failure\n");
 				return NULL;
 		}
+		memset(nd, 0, sizeof(struct node));
 		vlst->size += MAX_OBJECT_SIZE;
 	} 
 	// If buffer is full, remove the LRU node (tail) from the valid list,
@@ -90,7 +90,8 @@ struct node * cach_add(char * host, char * path,
 	strcpy(nd->path, path);
 	strncpy(nd->data, body, len);
 	nd->len = len;
-    nd->expire = expire;
+	nd->expr_year = expire->tm_year;
+	nd->expr_day = expire->tm_yday;
 	
 	return nd;
 }
@@ -127,7 +128,7 @@ void cach_delete(struct node *nd)
 // Return the address of the found node on succsse or NULL if not found;
 struct node * cach_search(char *host, char *path)
 {
-    struct node * nd = valid_list.head;
+    struct node *nd = valid_list.head;
 	while(nd != NULL) {
 	    //If both host names and pathes math;
         if((!strcmp(nd->host, host)) && (!strcmp(nd->path, path)))	    
@@ -147,15 +148,11 @@ void cach_free()
 		p = p->next;
 		free(prev);
 	}	
-    valid_list.head = valid_list.tail = NULL;
-
 	p = invalid_list.head;
 	while(p != NULL) {
 		prev = p;
 		p = p->next;
 		free(prev);
 	}
-	invalid_list.head = invalid_list.tail = NULL;
-
     return;
 }

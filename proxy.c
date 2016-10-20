@@ -10,10 +10,12 @@
 #define DEBUG
 #ifdef DEBUG
 # define dbg_printf(...) printf(__VA_ARGS__)
+# define dbg_print_request(...) print_request(__VA_ARGS__)
+# define dbg_print_response(...) print_response(__VA_ARGS__)
 #else 
-
-
 # define dbg_printf(...)
+# define dbg_print_request(...)
+# define dbg_print_response(...)
 #endif
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
@@ -51,245 +53,176 @@ int main(int argc, char **argv)
 							&clientlen);
 		Pthread_create(&tid, NULL, proxy_thread, (void *)(size_t)connect_fd);
 	}
-    
 	return 0;
 }
 
 void *proxy_thread(void *vargp)
 {
-    int client_fd = (int)(size_t)vargp;
+	dbg_printf("\n\nThis is a new thread\n");
+    struct file_dps fds = {(int)(size_t)vargp, -1};
 	Pthread_detach(pthread_self());
-    
-	//Flags for cache;
-	int search_cache = 1;
-	int cacheable = 1;
-	int hit = 0; 
-
-    //Local buffers;
-   	char line[MAXLINE];
-	char body[MAXLINE];
-	char hdrs[MAXLINE];
-	char location[MAXLINE];
-	char local_buf[MAX_BUF_SIZE];
-	int buf_len;
-    
-	// Request line and header parse;
-	rio_t rio_client;
-	rio_readinitb(&rio_client, client_fd);
-	if(rio_readlineb(&rio_client, line, MAXLINE) < 0) {
-	    close(client_fd);
-		pthread_exit(NULL);
+	
+	struct request_info *req = (struct request_info *) 
+							   malloc(sizeof(struct request_info));
+	if(req == NULL){
+		close(fds.client_fd);
+		error_msg("WARNING: Malloc failure");
 	}
-  	 
-	dbg_printf("\n\n\nRequest received: %s\n", line);
-	  
-    struct request_info req;
-	memset(&req, 0, sizeof(struct request_info));
+	memset(req, 0, sizeof(struct request_info));
 
-    req_line_parse(line, &req);
+	struct thread_info info = {req, NULL, &fds};
 
-	sprintf(body, "%s %s HTTP/1.0\r\n", req.method, req.path);
-
-	if(header_parse(&rio_client, &req, hdrs) || 
-	   (strcmp(req.method, "GET") && strcmp(req.method, "HEAD"))) {
-	    search_cache = 0;
-		cacheable = 0;
-	} 
-	// Do not search/store cache if the request method is neither GET nor HEAD;
-	strcat(body, hdrs);
+	process_request(&info);
+	dbg_print_request(req);
 
     //Cache part;
-    struct node * nd; 
-	time_t now;
-	struct tm *cur_time;
-	time(&now);
-	cur_time = gmtime(&now);
+	if(!(req->no_cache))
+		find_cache(&info);
+
+    //Cache NOT hit, connect the server:	
+	struct response_info *resp = (struct response_info *) 
+								 malloc(sizeof(struct response_info));
+	if(resp == NULL) {
+		thread_clean(&info);
+		error_msg("WARNING: Malloc failure");
+	}
+	memset(resp, 0, sizeof(struct response_info));
+	resp->cacheable = 1;
+	info.resp_ptr = resp;
+
+	commute_server(&info);
 	
-	if(search_cache) {
-        P(&mutex);
-
-		//Hit;
-	    if((nd = cach_search(req.host, req.path)) 
-			!= NULL) {
-			//Delete the cache copy if it has expired;
-		    struct tm *expire = nd->expire;
-		    if((expire != NULL) && 
-				((expire->tm_year < cur_time->tm_year) || 
-				((expire->tm_year == cur_time->tm_year) && 
-				(expire->tm_yday <= cur_time->tm_yday))) ) 
-                cach_delete(nd); 
-			else {
-			    hit = 1; 
-				buf_len = nd->len;
-				memcpy(local_buf, nd->data, buf_len); //Copy to a local buffer;
-			}
-		}
-		V(&mutex);
-	}
-    
-    dbg_printf("search_cache is %d, hit is %d\n", search_cache, hit);
-
-	if(hit) {
-	    rio_writen(client_fd, local_buf, buf_len);
-		close(client_fd);
-		pthread_exit(NULL);	
-	}
-
-    //Cache NOT hit, connect the server:
-	int server_fd;
-	if((server_fd = connect_server(&req)) == -1) 
-		error_msg(client_fd, "Server connection failure");
-
-	char entity[MAXLINE];
-	if(rio_writen(server_fd, body, strlen(body)) <= 0) {
-		close(server_fd);
-		error_msg(client_fd, "Server broke!");
-
-		int n = req.cont_length;
-		if(n > MAXLINE) {
-			int cnt_read = 0;
-			// Send the entity body (if any) in request to server line by line;
-			while(n > 0) {
-				if((cnt_read = 
-					rio_readlineb(&rio_client, line, min(n, MAXLINE)))<=0) {
-					close(client_fd);
-					pthread_exit(NULL);
-				}
-				if(rio_writen(server_fd, line, cnt_read) <= 0) {
-					close(server_fd);
-					error_msg(client_fd, "Server broke!");
-				}
-				n -= cnt_read;
-			}
-		}
-		else if(n > 0) {
-			if(rio_readlineb(&rio_client, entity, n) <= 0) {
-				close(client_fd);
-				pthread_exit(NULL);
-			}
-			if(rio_writen(server_fd, entity, n) <= 0) {
-				close(server_fd);
-				error_msg(client_fd, "Server broke!");	
-			}
-		}
-	}
-
-    rio_t rio_server;
-    rio_readinitb(&rio_server, server_fd);
-
-	int n;
-	struct tm *expire;
-	if((n = rio_readnb(&rio_server, local_buf, MAX_BUF_SIZE - 1)) <= 0) {
-		close(server_fd);
-		error_msg(client_fd, "Server broke!");
-	}
-	local_buf[n] = '\0';
-	int rd_flg; // redirection flag;
-	response_parse(local_buf, &expire, &cacheable, &rd_flg, location);
-
-	// Status code(300, 301, 302) in response indicates redirection, 
-	// in which case we'll retry connection to the server;
-	if(rd_flg && (req.cont_length <= MAXLINE)) {
-		sprintf(line, "%s %s HTTP/1.0\r\n", req.method, location);
-		req_line_parse(line, &req);
-		close(server_fd);
-
-		if((server_fd = connect_server(&req)) == -1) 
-			error_msg(client_fd, "Server connection failure");
-	
-		memset(body, 0, sizeof(body));
-		sprintf(body, "%s %s HTTP/1.0%s", req.method, req.path, hdrs);
-		dbg_printf("New request: %s %s HTTP/1.0\n", req.method, req.path);
-	
-		if((rio_writen(server_fd, body, strlen(body)) <= 0) ||
-			(req.cont_length > 0 && 
-			 rio_writen(server_fd, entity, req.cont_length) <= 0)) {
-			close(server_fd);
-			error_msg(client_fd, "Server broke!");
-		}
-		rio_readinitb(&rio_server, server_fd);
-		if((n = rio_readnb(&rio_server, local_buf, MAX_BUF_SIZE - 1)) <= 0) {
-			close(server_fd);
-			error_msg(client_fd, "Server broke!");
-		}
-		local_buf[n] = '\0';
-		response_parse(local_buf, &expire, &cacheable, NULL, location);
-	}
-
-	if(expire != NULL) {
-        char str[100];
-		strftime(str, 100, "%a, %d %b %Y %H:%M:%S", expire);
-		dbg_printf("Expire time is %s\n", str);
-	}
-
-    dbg_printf("cacheable = %d, n is %d\n", cacheable, n);
-    
-	if(cacheable && (n <= MAX_OBJECT_SIZE)) { 
+    //If cacheable than cache the response;
+	if(resp->cacheable) { 
 		P(&mutex);
-	    if((nd =  cach_add(req.host, req.path, expire, local_buf, n))
-			== NULL) {
-		    printf("Fatal error: out of memory!\n");
-		    cach_free();	
-			exit(0);
-		}
+		cach_add(req->host,req->path, &(resp->expire),resp->response,
+				 resp->resp_len);
 		V(&mutex);
 	}
-    
-	do {
-	    if(write(client_fd, local_buf, n) <= 0) {
-		    close(client_fd);
-			close(server_fd);
-			pthread_exit(NULL);
-		}
-	} while((n = rio_readnb(&rio_server, local_buf, MAX_BUF_SIZE)) > 0);
-
-	close(server_fd);
-	close(client_fd);
+	thread_clean(&info);
     return NULL;
 }
 
-void req_line_parse(char * line, struct request_info * p) 
+inline void process_request(struct thread_info *info)
+{
+	char line[MAXLINE];
+	readline_client(info, line, MAXLINE); 
+	dbg_printf("Request line is: %s", line);
+
+	req_line_parse(info, line);
+	header_parse(info);
+	return;
+}
+
+void req_line_parse(struct thread_info *info, char *line)
 {
 	char uri[MAXLINE];
-	char port[24];
-    sscanf(line, "%s %s %s", p->method, uri, p->version);	
-	upper_string(p->method);
+	struct request_info *req = info->req_ptr;
 
-	char *sp1, *sp2, *sp3;
-	if((sp1 = strstr(uri, "://")))
-		sp1 += strlen("://");
-	else
-		sp1 = uri;
+    sscanf(line, "%s %s %s", req->method, uri, req->version);	
+	upper_string(req->method);
 
-	if((sp2 = strstr(sp1, ":")) != NULL) {
-	    if((sp3 = strstr(sp2, "/")) == NULL)
-			strcpy(p->path, "/");
-		else {
-		    strcpy(p->path, sp3);
-			*sp3 = '\0';	
-		}
-		sp2 ++;
-		strcpy(port, sp2);
-		p->port = atoi(port);
-		*(sp2 - 1) = '\0';
-    }
+	char *p, *dest;
+	if((p = strstr(uri, "://")))
+		p += strlen("://");
+	else 
+		p = uri;
+	//Host:
+	dest = req->host;
+	while((*p != '/') && (*p != ':') && (*p != '\0'))
+		*dest++ = *p++;
+	*dest = '\0';
+	//Path:
+	dest = req->path;
+	while((*p != '/') && (*p != '\0'))
+		++p;
+	if(*p == '\0')
+		*dest++ = '/';
 	else {
-	    if((sp3 = strstr(sp1, "/")) == NULL)
-			strcpy(p->path, "/");
-	    else {
-		    strcpy(p->path, sp3);
-			*sp3 = '\0';
-		}
-        p->port = 80;
+		while((*p != ':') && (*p != '\0'))
+			*dest++ = *p++;
 	}
-	
-	strcpy(p->host, sp1);
+	*dest = '\0';
+	//Port:
+	dest = req->port;
+	if((p = strstr(uri, "://"))) {
+		p += strlen("://");
+		p = strstr(p, ":");
+	}
+	else {
+		p = strstr(uri, ":");
+	}
+	if(p) {
+		++p;
+		while(isdigit(*p))
+			*dest++ = *p++;
+		*dest = '\0';
+	}
+	if(*(req->port) == '\0')	
+        strcpy(req->port, "80");
+
+	//Do not search/store cache if the method is neither GET nor HEAD;
+	if(strcmp(req->method, "GET") && strcmp(req->method, "HEAD"))
+		req->no_cache = 1;
 
 	return;
 }
 
+// Return 1 if conditions for no-cache-search and not-cacheable are met, 0 o/w;
+void header_parse(struct thread_info *info)
+{
+    char line[2048];
+	char name[32];
+	char value[2048];
+	int hflag = 0; // Whether HOST is in the headers;
+	struct request_info *req = info->req_ptr;
+	while(readline_client(info, line, 1024) > 0 ) {
+		if((!strcmp(line, "\r\n")) || (!strcmp(line, "\n")))
+			break;
+	    sscanf(line, "%s %s", name, value);
+		upper_string(name);
+	
+		if(!strcmp(name, "HOST:")) 
+			hflag = 1;
+		else if(!strcmp(name, "CONTENT-LENGTH:")) 
+			req->cont_length = atoi(value);
+		if(!strcmp(name, "AUTHORIZATION:") ||
+		   !strcmp(name, "IF-MODIFIED-SINCE:") ||
+		   (!strcmp(name, "PRAGMA:") && 
+		    strstr(upper_string(value), "NO-CACHE") != NULL)
+		   ) 
+			req->no_cache = 1;
+		else if(!strcmp(name, "USER-AGENT:")) 
+			continue;
+		else if(!strcmp(name, "ACCEPT:")) 
+			continue;
+		else if(!strcmp(name, "ACCEPT-ENCODING:")) 
+			continue;
+		else if(!strcmp(name, "CONNECTION:")) 
+			continue;
+		else if(!strcmp(name, "PROXY-CONNECTION:")) 
+			continue;
+		strcat(req->hdrs, line);
+	}
+	//Add host info if no host in the request header;
+    if(!hflag) {
+		if(!strcmp(req->port, "80"))
+		    sprintf(req->hdrs, "Host: %s\r\n%s", req->host, req->hdrs);
+	    else
+			sprintf(req->hdrs, "Host: %s:%s\r\n%s", 
+					req->host, req->port, req->hdrs);
+	}
+	strcat(req->hdrs, user_agent);
+	strcat(req->hdrs, accept_file);
+	strcat(req->hdrs, accept_encoding);
+	sprintf(req->hdrs, "%sConnection: close\r\nProxy-Connection: close\r\n\r\n"
+					   , req->hdrs);	
+
+	return; 
+}
+
 // Return -1 on error, and the file descriptor of the server otherwise;
-int connect_server(struct request_info * req)
+int connect_server(struct thread_info *info)
 {
     int socket_fd;
 	struct addrinfo hints, *serverinfo, *p;
@@ -299,13 +232,8 @@ int connect_server(struct request_info * req)
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 
-	char service[16];
-
-	if(req->port)
-		dec2str(req->port, service); 
-	else strcpy(service, "http");	
-
-	if((getaddrinfo(req->host, service, &hints, &serverinfo)) != 0)
+	struct request_info *req = info->req_ptr;
+	if((getaddrinfo(req->host, req->port, &hints, &serverinfo)) != 0)
         return -1; 
 
 	for(p = serverinfo; p != NULL; p = p->ai_next) {
@@ -316,109 +244,336 @@ int connect_server(struct request_info * req)
 			continue;  
 		break;  
 	}
-    
 	freeaddrinfo(serverinfo);
 
+	dbg_printf("p is 0x%p, socket_fd is %d\n", p, socket_fd);
 	if(p == NULL)
 		return -1;
 
 	return socket_fd;
 } 
 	
-
-void dec2str(int src, char * dest)
+void commute_server(struct thread_info *info)
 {
-    int cnt = 0;
-    int num = src;
-    while(num > 0) {
-        num = num/10;
-		cnt++;    
-    }  
-    
-	num = src;
-	int i;
-	for(i = cnt - 1; i>= 0; i--) {
-	    dest[i] = 48 + num - ((num/10) * 10);
-		num = num/10;	
-	} 
+	struct request_info *req = info->req_ptr;
+	struct response_info *resp = info->resp_ptr;
+	struct file_dps *fds = info->fdp;
+	//Connect server and send request line and headers to it;
+	if((fds->server_fd = connect_server(info)) == -1) {
+		thread_clean(info);
+		error_msg("Server connection failure");
+	}
 
-	dest[cnt] = '\0';
+	char line[MAXLINE];
+	sprintf(line, "%s %s %s\r\n", req->method, req->path, req->version);
+	dbg_printf("Request line sent to server is %s\n", line);
+	write_2_server(info, line, strlen(line));
+	write_2_server(info, req->hdrs, strlen(req->hdrs));
+
+	//Send the request entity (if any) to the server;
+	int n = req->cont_length;
+	while(n > 0) {
+			int cnt_read = read_client(info, req->entity, MAXLINE);
+			write_2_server(info, req->entity, cnt_read);
+			n -= cnt_read;
+	}
+
+	// Read response from server;
+	resp->resp_len = read_server(info, resp->response, MAX_OBJECT_SIZE + 16);
+	if(resp->resp_len > MAX_OBJECT_SIZE) 
+		resp->cacheable = 0;
+
+	response_parse(info);
+	dbg_print_response(resp);
 	
+	// Status code in (300, 301, 302) indicates redirection, 
+	// in which case we'll retry connection to the server;
+	// We only cache MAXLINE in bytes of the request entity line, beyond that 
+	// we'll have to reopen another thread;
+	if(((resp->scode == 300) || (resp->scode == 301) || (resp->scode == 302)) 
+		&& (req->cont_length <= MAXLINE)) {
+		reconnect_server(info);
+		dbg_print_response(resp);
+	}
+	write_2_client(info, resp->response, resp->resp_len);
+	while((n = read_server(info, line, MAXLINE)) > 0)
+		write_2_client(info, line, n);
+
 	return;
-	
 }
 
-// Return 1 if conditions for no-cache-search and not-cacheable are met, 0 o/w;
-int header_parse(rio_t * rp, struct request_info *req, char *headers)
+void reconnect_server(struct thread_info *info)
 {
-    char line[MAXLINE];
-	char name[32];
-	char value[128];
-	int hflag = 0;
-	int no_cach_flag = 0;
+	dbg_printf("Reconnection revokded\n");
+	char line[MAXLINE];
+	struct request_info *req = info->req_ptr;
+	struct response_info *resp = info->resp_ptr;
+	struct file_dps *fds = info->fdp;
+	sprintf(line, "%s %s %s\r\n", req->method, resp->reloc, req->version);
+	req_line_parse(info, line);
+	if(!(req->no_cache)) 
+		find_cache(info);
 
-	req->cont_length = 0;
-//	int hd_log_fd = open(HEADER_LOG, O_WRONLY, 0);
-	while((rio_readlineb(rp, line, MAXLINE)) > 0 ) {
-//		rio_writen(hd_log_fd, line, MAXLINE);
-		if((!strcmp(line, "\r\n")) || (!strcmp(line, "\n")))
-			break;
-	    sscanf(line, "%s %s", name, value);
-		upper_string(name);
-	
-		if(!strcmp(name, "HOST:")) 
-			hflag = 1;
-		else if(!strcmp(name, "CONTENT-LENGTH:")) 
-			req->cont_length = atoi(value);
-		else if(!strcmp(name, "AUTHORIZATION:")) 
-			no_cach_flag = 1;
-		else if(!strcmp(name, "IF-MODIFIED-SINCE:"))
-			no_cach_flag = 1;
-		else if(!strcmp(name, "PRAGMA:")) {
-			if(strstr(upper_string(value), "NO-CACHE") != NULL)
-				no_cach_flag = 1;
-		}
-		else if(!strcmp(name, "USER-AGENT:"))
-			break;
-		else if(!strcmp(name, "ACCEPT:"))
-			break;
-		else if(!strcmp(name, "ACCEPT-ENCODING:"))
-			break;
-		else if(!strcmp(name, "CONNECTION:"))
-			break;
-		else if(!strcmp(name, "PROXY-CONNECTION:"))
-			break;
-		strcat(headers, line);
-	}
+	close(fds->server_fd);
+	if((fds->server_fd = connect_server(info)) == -1) {
+		thread_clean(info);
+		error_msg("Server connection failure");
+	}		
 
-	//Add host info if no host in the request header;
-    if(!hflag) {
-		char *p;
-		if((p = strstr(req->host, "://")))
-			strcpy(value, p + strlen("://"));
-		else 
-			strcpy(value, req->host);
-		if(req->port == 80)
-		    sprintf(headers, "%sHost: %s\r\n", headers, value);
-	    else
-			sprintf(headers, "%sHost: %s:%d\r\n", headers, value, req->port);
-	}
-	
-    strcat(headers, user_agent);
-	strcat(headers, accept_file);
-	strcat(headers, accept_encoding);
-	sprintf(headers, "%sConnection: close\r\nProxy-Connection: close\r\n\r\n",
-			headers);	
-	
-	if(no_cach_flag)
-		return 1;
+	memset(line, 0, MAXLINE);
+	sprintf(line, "%s %s %s\r\n", req->method, req->path, 
+			req->version);
+	dbg_printf("New request: %s %s %s\n", req->method, req->path,req->version);
 
-	dbg_printf("%s \n", req->host);
+	write_2_server(info, line, strlen(line));
+	write_2_server(info, req->hdrs, strlen(req->hdrs));
+	if(req->cont_length > 0) 
+		 write_2_server(info, req->entity, req->cont_length);
 
-	return 0;
+	resp->resp_len = read_server(info, resp->response, MAX_OBJECT_SIZE + 16);
+	if(resp->resp_len > MAX_OBJECT_SIZE)
+		resp->cacheable = 0;
+
+	response_parse(info);
+	return;
 }
 
-char * upper_string(char *ptr)
+/*Parse the response in the sting response, 
+   and fill in the values of expire and cach_flag; */
+void response_parse(struct thread_info *info)
+{
+	struct response_info *resp = info->resp_ptr;
+	char line[MAXLINE];
+	char vers[16];
+	char code[16];
+	char phr[16];
+	int n;
+	char *str = resp->response;
+	char *p;
+	struct tm *expire = &(resp->expire);
+	struct tm date;
+	time_t now;
+	struct tm *cur_time;
+	// Get the current time;
+	time(&now);
+	cur_time = gmtime(&now);
+	memset(&date, 0, sizeof(struct tm));
+	
+	if((n = sgetline(line, str)) > 0) {
+		dbg_printf("Response line is: %s\n", line);
+		sscanf(line, "%s %s %s", vers, code, phr);
+		resp->scode = atoi(code);
+		str += n;
+	}
+	while((n = sgetline(line, str)) > 0) {
+	    if(!strcmp(line, "\r\n"))
+			break;			
+		if((strstr(line, "Location"))) {
+			char *dest = resp->reloc;
+			p = line + strlen("Location:");
+			//remove spaces and \r\n;
+			while((*p != '\0') && isspace(*p))
+				++p;
+			while((*p != '\0') && !isspace(*p) && (*p != '\r')&& (*p != '\n'))
+				*dest++ = *p++;
+
+			*dest = '\0';
+			break;
+		}
+	    if(strstr(line, "WWW-Authenticate:")) 
+            resp->cacheable = 0;
+		else if((p = strstr(line, "Expires:"))) {
+		    p += strlen("Expires:");
+			if(str2time(p, expire) || 
+				((expire->tm_year < cur_time->tm_year)|| 
+					((expire->tm_year == cur_time->tm_year) &&
+					(expire->tm_yday <=  cur_time->tm_yday)))  
+				)// Expire date is not valid or is before or at today;
+				resp->cacheable = 0;
+		}
+		else if((p = strstr(line, "Date:"))) {
+			p += strlen("Date:");
+			str2time(p, &date);
+        }
+		str += n;
+	} 
+	if(resp->scode == 304)
+		resp->cacheable = 0;
+    if((date.tm_year > 0) && (expire->tm_year > 0) &&
+		((expire->tm_year < date.tm_year) || 
+		((expire->tm_year == date.tm_year) &&
+		(expire->tm_yday <= date.tm_yday)))
+		) // If Expire is before Date, do not cache;
+	    resp->cacheable = 0;   
+
+	return;
+}
+
+void find_cache(struct thread_info *info)
+{
+	struct request_info *req = info->req_ptr;
+    struct node *nd; 	
+	time_t now;
+	struct tm *cur_time;
+	time(&now);
+	cur_time = gmtime(&now);
+	P(&mutex);
+	if((nd = cach_search(req->host, req->path)) != NULL) {
+			//Delete the cache copy if it has expired;
+		    if((nd->expr_year > 0) && 
+				((nd->expr_year < cur_time->tm_year) || 
+				((nd->expr_year == cur_time->tm_year) && 
+				(nd->expr_day <= cur_time->tm_yday)))) 
+                cach_delete(nd); 
+			else { //hit;
+				dbg_printf("HIT\n");
+				write_2_client(info, nd->data, nd->len);
+				thread_clean(info);
+				pthread_exit(NULL);
+			}
+	}
+	V(&mutex);
+	return;
+}
+
+inline void thread_clean(struct thread_info *info)
+{
+	free(info->req_ptr);
+	free(info->resp_ptr);
+
+	struct file_dps *fds = info->fdp;
+	close(fds->client_fd);
+	if(fds->server_fd >= 0)
+		close(fds->server_fd);	
+	return;
+}
+
+int readline_client(struct thread_info *info, char *buf, int len)
+{
+	int nleft = len;
+	int rc;
+	char c, *p = buf;
+	int fd = (info->fdp)->client_fd;
+	while(nleft > 0) {
+		if((rc = read(fd, &c, 1)) == 1) {
+			*p++ = c;
+			--nleft;
+			if(c == '\n') 
+				break;
+		} else if(rc == 0) {
+			break;
+		} else {
+			if(errno != EINTR) {
+				thread_clean(info);
+				error_msg("Fail to read from client(-1)");
+			}
+		}
+	}
+	*p = 0;	
+	if(len == nleft) {
+		thread_clean(info);
+		error_msg("Fail to read from client(0)");
+	}
+	return (len - nleft);
+}
+
+int read_client(struct thread_info *info, char *buf, int len)
+{
+	int nleft = len;
+	int nread;
+	char *p = buf;
+	int fd = (info->fdp)->client_fd;
+	while(nleft > 0) {
+		if((nread = read(fd, p, nleft)) < 0) {
+			if(errno == EINTR)
+				nread = 0;
+			else {
+				thread_clean(info);
+				error_msg("Fail to read from client(-1)");
+			}	
+		}
+		else if(nread == 0)
+			break;
+		nleft -= nread;
+		p += nread;
+	}
+	if(len == nleft) {
+		thread_clean(info);
+		error_msg("Fail to read from client(0)");
+	}
+	return (len - nleft);
+}
+
+int read_server(struct thread_info *info, char *buf, int len)
+{
+	int nleft = len;
+	int nread;
+	char *p = buf;
+	int fd = (info->fdp)->server_fd;
+	while(nleft > 0) {
+		if((nread = read(fd, p, nleft)) < 0) {
+			if(errno == EINTR)
+				nread = 0;
+			else {
+				thread_clean(info);
+				error_msg("Fail to read from server(-1)");
+			}	
+		}
+		else if(nread == 0)
+			break;
+		nleft -= nread;
+		p += nread;
+	}	
+	if(len == nleft) {
+		thread_clean(info);
+		error_msg("Fail to read from server(0)");
+	}
+	return (len - nleft);
+}
+
+int write_2_client(struct thread_info *info, char *buf, int len)
+{
+	int nleft = len;
+	int nwritten;
+	int fd = (info->fdp)->client_fd;
+	char *p = buf;
+	while(nleft > 0) {
+		if((nwritten = write(fd, p, nleft)) <= 0) {
+			if(errno == EINTR)
+				nwritten = 0;
+			else {
+				thread_clean(info);
+				error_msg("Fail to write to client");
+			}
+		}
+		nleft -= nwritten;
+		p += nwritten;
+	}
+	return len;
+}
+
+int write_2_server(struct thread_info *info, char *buf, int len)
+{
+    int nleft = len;
+	int nwritten;
+	int fd = (info->fdp)->server_fd;
+	char *p = buf;
+	while(nleft > 0) {
+		if((nwritten = write(fd, p, nleft)) <= 0) {
+			if(errno == EINTR)
+				nwritten = 0;
+			else {
+				thread_clean(info);
+				error_msg("Fail to write to server");
+			}
+		}
+		nleft -= nwritten;
+		p += nwritten;
+	}
+	return len;
+}
+
+inline char *upper_string(char *ptr)
 {
 	char *p = ptr;
     while((*p) != '\0') {
@@ -428,129 +583,26 @@ char * upper_string(char *ptr)
 	return ptr;
 }
 
-/* Parse the response in the sting response, 
-   and fill in the values of expire and cach_flag; */
-void response_parse(char *response, struct tm **expire_ptr, 
-				    int *cach_flag, int *rd_flg, char *location)
-{
-	char line[MAXLINE];
-	char vers[16];
-	char code[16];
-	char phr[16];
-	int n;
-	int expire_flg = 0;
-	char *str = response;
-	char *p;
-	struct tm *expire;
-	struct tm date;
-	time_t now;
-	struct tm *cur_time;
-	time(&now);
-	cur_time = gmtime(&now);
-	
-	*expire_ptr = NULL;
-	memset(&date, 0, sizeof(struct tm));
-	
-	if(rd_flg && ((n = sgetline(line, str)) > 0)) {
-		sscanf(line, "%s %s %s", vers, code, phr);
-		//Multiple Choices; Moved Permanently; Moved Temporarily;
-		if(atoi(code) == 300 || atoi(code) == 301 || atoi(code) == 302)
-			*rd_flg = 1;
-		else 
-			*rd_flg = 0;
-
-		str += n;
-	}
-
-	if(rd_flg && (*rd_flg == 1)) {
-		while((n = sgetline(line, str)) > 0) {
-			if(!strcmp(line, "\r\n"))
-				break;
-			if((strstr(line, "Location"))) {
-				char * p = line + strlen("Location:");
-				//remove spaces and \r\n;
-				while(*p != '\0' && isspace(*p))
-					++p;
-				strcpy(location, p);
-				while(*p != '\0' && !isspace(*p) && *p != '\r' && *p != '\n')
-					++p;
-				*p = '\0';
-				break;
-			}
-			str += n;
-			dbg_printf("%s\n", line);
-		}
-		return;
-	}
-
-	while((n = sgetline(line, str)) > 0) {
-	    if(!strcmp(line, "\r\n"))
-		break;
-	    if(strstr(line, "WWW-Authenticate:")) 
-            *cach_flag = 0;
-		else if((p = strstr(line, "Expires:"))) {
-		    p += strlen("Expires:");
-
-			if((expire = malloc(sizeof(struct tm))) == NULL) {
-			    printf("Out of memory!\n");
-				cach_free();
-				exit(0);
-			}
-			expire_flg = 1;
-	        *expire_ptr = expire;
-			memset(expire, 0, sizeof(struct tm));
-
-			if(str2time(p, expire) < 0 ) //Not a valid expire time;
-				*cach_flag = 0;
-            
-			else if((expire->tm_year < cur_time->tm_year)
-					|| 
-					((expire->tm_year == cur_time->tm_year) &&
-					(expire->tm_yday <=  cur_time->tm_yday))
-					)  // Expire date is before or at today;
-				*cach_flag = 0;
-
-		}
-		else if((p = strstr(line, "Date:"))) {
-			p += strlen("Date:");
-			str2time(p, &date);
-        }
-		
-		str += n;
-	} 
-
-    if(expire_flg && 
-		((expire->tm_year < date.tm_year) // Expire before Date;
-		||
-		((expire->tm_year == date.tm_year) &&
-		(expire->tm_yday <= date.tm_yday)))
-		)
-	    *cach_flag = 0;
-    
-	return;
-}
-
 //Getline from string src and put the line in dest, including the newline char;
-int sgetline(char *dest, char *src)
+inline int sgetline(char *dest, char *src)
 {
 	int c;
 	int n = 0;
     while(((c = *src) != '\n') && (c != '\0')) { 
 	    *dest++ = *src++;
-		n++;
+		++n;
 	}
     if(c == '\n') {
 		*dest++ = '\n';
-		n++;
-	}
-	
+		++n;
+	}	
 	*dest = '\0';
 	return n;
 }
 
-/* Return 0 on success and -1 on error; 
-   Fill in the struct tm pointed by tm using info from string s; */
-int str2time(const char *s, struct tm *tm)
+// Return 0 on success and -1 on error;
+// Fill in the struct tm pointed by tm using info from string s;
+inline int str2time(const char *s, struct tm *tm)
 {
 	if((strptime(s, "%n%a, %d %b %Y %H:%M:%S", tm) != NULL) 
 		&& (strptime(s, "%n%A, %d-%b-%y %H:%M:%S", tm) != NULL) 
@@ -562,13 +614,10 @@ int str2time(const char *s, struct tm *tm)
 }
 
 // Send the error message back to fd, then close it and exit the thread;
-void error_msg(int fd, const char *message)
+inline void error_msg(const char *message)
 {
-	rio_writen(fd, (void *)message, strlen(message));
-	rio_writen(fd, "\r\n", 2);
-	close(fd);
+	printf("%s\n", message);
     pthread_exit(NULL);
-
 }
 
 void sigpipe_handler(int sig)
@@ -582,5 +631,25 @@ void sigint_handler(int sig)
     printf("\nSIGINT received!\n");
 	cach_free();
 	exit(0);
+	return;
+}
+
+void print_request(struct request_info *req)
+{
+	printf("Metainfo of the request: \n");
+	printf("method is %s, version is %s, port is %s and host+path is %s %s\n", 
+		   req->method, req->version, req->port, req->host, req->path);
+	printf("cont_len is %d, no_cache is %d\n", req->cont_length,req->no_cache);
+	printf("header is:\n%s\n", req->hdrs);
+	return;
+}
+void print_response(struct response_info *resp)
+{
+	printf("Metainfo of the response: \n");
+	printf("status code is %d, resp_len is %d and cacheable is %d\n",
+		   resp->scode, resp->resp_len, resp->cacheable);
+	printf("relocation is %s\n", resp->reloc);
+	printf("The expire year is %d and the expire day is %d\n", 
+	       (resp->expire).tm_year, (resp->expire).tm_yday);
 	return;
 }

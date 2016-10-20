@@ -23,5 +23,4 @@ clean:
 	rm -f *~ *.o proxy core
 
 logclean:
-	echo " " > server_log |> header_log |> resp_log 
-
+	echo " " > log
